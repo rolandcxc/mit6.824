@@ -70,7 +70,9 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		log.Printf("Receive Job: %v, job: %v", job, job.Job)
 		switch job.Job.Type {
 		case JobMap:
+			log.Println("start map job")
 			w.doMap(job, mapf)
+			log.Println("finish map job")
 			w.JobSucceed(job.Job)
 
 		case JobReduce:
@@ -89,6 +91,7 @@ func (w *worker) doMap(job GetJobResp, mapf func(string, string) []KeyValue) {
 		log.Fatalf("cannot ReadFile %v", filename)
 	}
 
+	log.Println("finish ReadFile")
 	kvs := mapf(filename, string(content))
 
 	res := make(map[int][]KeyValue)
@@ -97,6 +100,7 @@ func (w *worker) doMap(job GetJobResp, mapf func(string, string) []KeyValue) {
 		res[taskNum] = append(res[taskNum], kv)
 	}
 
+	log.Println("finish sort")
 	for num, kva := range res {
 		imPath := fmt.Sprintf("%s%d", job.ImBasePath, num)
 
@@ -120,6 +124,7 @@ func (w *worker) doMap(job GetJobResp, mapf func(string, string) []KeyValue) {
 			log.Fatalf("Rename: %v, error: %s", f.Name(), err)
 		}
 		f.Close()
+		log.Println("finish " + imFilename)
 	}
 }
 
@@ -214,7 +219,6 @@ func (w *worker) HeartBeat() {
 	if resp.HaveWork && w.status == WorkerStatusIdle {
 		w.needWork <- struct{}{}
 	}
-	return
 }
 
 func (w *worker) JobSucceed(job *Job) {
@@ -226,7 +230,6 @@ func (w *worker) JobSucceed(job *Job) {
 	resp := JobSucceedResp{}
 
 	call("Coordinator.JobSucceed", &req, &resp)
-	return
 }
 
 //
@@ -235,8 +238,6 @@ func (w *worker) JobSucceed(job *Job) {
 // returns false if something goes wrong.
 //
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	log.Printf("Call RPC %s: %v", rpcname, args)
-
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
@@ -249,9 +250,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-
-	log.Printf("Call RPC %s, Resp: %v", rpcname, reply)
-
 	fmt.Println(err)
 	return false
 }

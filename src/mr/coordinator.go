@@ -91,14 +91,14 @@ func (c *Coordinator) GetJob(req *GetJobReq, resp *GetJobResp) error {
 		return nil
 	}
 
-	if len(c.pendingM) == 0 && len(c.pendingR) == 0 {
-		// TODO
-		resp.Job = &Job{
-			Type: JobNone,
-		}
+	// if len(c.pendingM) == 0 && len(c.pendingR) == 0 {
+	// 	// TODO
+	// 	resp.Job = &Job{
+	// 		Type: JobNone,
+	// 	}
 
-		return nil
-	}
+	// 	return nil
+	// }
 
 	var job *Job
 	if len(c.pendingM) > 0 {
@@ -115,6 +115,30 @@ func (c *Coordinator) GetJob(req *GetJobReq, resp *GetJobResp) error {
 		c.scheduleR[job.Key] = job
 	}
 
+	if job == nil && len(c.scheduleM) > 0 {
+		// TODO
+		for _, j := range c.scheduleM {
+			// 超额分配
+			job = j
+			break
+		}
+	}
+
+	if job == nil && len(c.scheduleR) > 0 {
+		for _, j := range c.scheduleR {
+			// 超额分配
+			job = j
+			break
+		}
+	}
+
+	if job == nil {
+		resp.Job = &Job{
+			Type: JobNone,
+		}
+
+		return nil
+	}
 	wi.takeJob(job)
 
 	resp.Job = job
@@ -126,15 +150,15 @@ func (c *Coordinator) GetJob(req *GetJobReq, resp *GetJobResp) error {
 }
 
 func (c *Coordinator) JobSucceed(req *JobSucceedReq, resp *JobSucceedResp) error {
-	log.Printf("Receive RPC JobSucceed, Worker: %d, Job: %v", req.WorkerID, *req.Job)
+	log.Printf("Receive RPC JobSucceed, Worker: %d, Job: %+v", req.WorkerID, *req.Job)
 
 	c.mapLock.Lock()
 	defer c.mapLock.Unlock()
 
 	job := req.Job
 	w := c.workers[req.WorkerID]
-	if w.job.Key != job.Key {
-		log.Printf("job conflict")
+	if w.job == nil || w.job.Key != job.Key {
+		log.Printf("worker 提交的任务已经分配给别人")
 		// TODO worker提交的任务和记录的发给它的任务不一样
 	}
 
@@ -144,6 +168,7 @@ func (c *Coordinator) JobSucceed(req *JobSucceedReq, resp *JobSucceedResp) error
 		_, exist := c.scheduleM[job.Key]
 		if !exist {
 			// 该任务已经被其它worker执行完成
+			log.Printf("该任务已经被其它worker提交， %+v", *job)
 			return nil
 		}
 		delete(c.scheduleM, job.Key)
@@ -264,6 +289,7 @@ func (c *Coordinator) checkWorkers() {
 		// 超过3秒未HeartBeat
 		if w.job != nil {
 			c.recycleJob(w.job)
+			w.job = nil
 		}
 	}
 }
@@ -286,6 +312,18 @@ const (
 	JobMap    = 1
 	JobReduce = 2
 )
+
+func (j JobType) String() string {
+	switch j {
+	case JobNone:
+		return "JobNone"
+	case JobMap:
+		return "JobMap"
+	case JobReduce:
+		return "JobReduce"
+	}
+	return ""
+}
 
 type Job struct {
 	Type          JobType
