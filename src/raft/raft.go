@@ -19,6 +19,7 @@ package raft
 
 import (
 	"math/rand"
+	"sort"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -99,6 +100,8 @@ type Raft struct {
 	raftLog    *raftLog
 
 	rpcProxy *proxy
+
+	applyCh chan ApplyMsg
 }
 
 type StateType string
@@ -110,8 +113,9 @@ const (
 )
 
 type raftLog struct {
-	entries []*Entry
-	offset  int
+	entries   []*Entry
+	lastEntry *Entry
+	offset    int // index-offset为该条日志在entries中的位置
 
 	// soft state for all roles
 	commitIndex int
@@ -123,20 +127,46 @@ type raftLog struct {
 }
 
 func (l *raftLog) lastIndex() int {
-	return len(l.entries) + l.offset
+	return l.lastEntry.Index
+}
+
+func (l *raftLog) peerNext(i int) int {
+	return l.nextIndex[i]
+}
+
+func (l *raftLog) getEntries(start int) []*Entry {
+	if !l.validIndex(start) {
+		// TODO Panic
+		return nil
+	}
+	return l.entries[start-l.offset:]
+}
+
+func (l *raftLog) validIndex(index int) bool {
+	if index-l.offset > len(l.entries) {
+		return false
+	}
+	if index-l.offset < 0 {
+		return false
+	}
+	return true
 }
 
 // 0 表示不存在该日志
 func (l *raftLog) term(index int) int {
 	// TODO 校验index
-	if index-l.offset > len(l.entries)-1 {
+	if !l.validIndex(index) {
 		return 0
 	}
 	return l.entries[index-l.offset].Term
 }
 
 func (l *raftLog) lastTerm() int {
-	return len(l.entries)
+	return l.lastEntry.Term
+}
+
+func (l *raftLog) last() *Entry {
+	return l.lastEntry
 }
 
 func (l *raftLog) isUpToDate(index, term int) bool {
@@ -146,6 +176,12 @@ func (l *raftLog) isUpToDate(index, term int) bool {
 func (l *raftLog) appendEntries(entries []*Entry, preIndex int) {
 	l.entries = l.entries[:preIndex-l.offset+1]
 	l.entries = append(l.entries, entries...)
+	l.lastEntry = entries[len(entries)-1]
+}
+
+func (l *raftLog) appendSingleEntry(entry *Entry) {
+	l.entries = append(l.entries, entry)
+	l.lastEntry = entry
 }
 
 func (rf *Raft) getCurrentTerm() int {
@@ -167,7 +203,7 @@ func (rf *Raft) setCurrentTerm(v int) {
 type Entry struct {
 	Term  int
 	Index int
-	Data  []byte
+	Data  interface{}
 }
 
 // return currentTerm and whether this server
@@ -266,9 +302,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	defer func() {
-		DPrintf("[RequestVote]%d, reply: %+v, term: %d, voted: %d", rf.me, *reply, rf.currentTerm, rf.votedFor)
-	}()
+	//defer func() {
+	//	DPrintf("[RequestVote]%d, reply: %+v, term: %d, voted: %d", rf.me, *reply, rf.currentTerm, rf.votedFor)
+	//}()
 
 	if args.Term < rf.getCurrentTerm() {
 		reply.VoteGranted = false
@@ -345,13 +381,20 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term       int
+	Success    bool
+	RejectHint int
+	RejectTerm int
 }
 
 func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	defer func() {
+		DPrintf("[AppendEntries]%d, reply: %+v, term: %d, lastIndex: %d, commit: %d", rf.me, *reply, rf.currentTerm, rf.raftLog.lastIndex(), rf.raftLog.commitIndex)
+	}()
+
 	if arg.Term < rf.getCurrentTerm() {
 		reply.Term = rf.getCurrentTerm()
 		reply.Success = false
@@ -364,24 +407,63 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	rf.becomeFollower(arg.Term, arg.LeaderID)
 
-	if len(arg.Entries) > 0 {
-		term := rf.raftLog.term(arg.PrevLogIndex)
-		if term == 0 || term != arg.PrevLogTerm {
-			reply.Term = rf.getCurrentTerm()
-			reply.Success = false
-			return
-		}
+	term := rf.raftLog.term(arg.PrevLogIndex)
+	if term == 0 || term != arg.PrevLogTerm {
+		reply.Term = rf.getCurrentTerm()
+		reply.Success = false
+		return
+	}
 
+	if len(arg.Entries) > 0 {
 		rf.raftLog.appendEntries(arg.Entries, arg.PrevLogIndex)
 	}
 
 	if arg.LeaderCommit > rf.raftLog.commitIndex {
 		rf.raftLog.commitIndex = min(arg.LeaderCommit, rf.raftLog.lastIndex())
+		rf.apply()
 	}
 
 	reply.Term = rf.getCurrentTerm()
 	reply.Success = true
 	return
+}
+
+func (l *raftLog) findConflictByTerm(index int, term int) int {
+	if li := l.lastIndex(); index > li {
+		return index
+	}
+	for {
+		logTerm := l.term(index)
+		if logTerm <= term {
+			break
+		}
+		index--
+	}
+	return index
+}
+
+
+func (rf *Raft) apply() {
+	DPrintf("start apply!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	rl := rf.raftLog
+	if rl.lastApplied == rl.commitIndex {
+		return
+	}
+
+	entries := rl.entries[rl.lastApplied-rl.offset+1 : rl.commitIndex-rl.offset+1]
+	rl.lastApplied = rl.commitIndex
+
+	for _, e := range entries {
+		m := ApplyMsg{
+			CommandValid: true,
+			Command:      e.Data,
+			CommandIndex: e.Index - 1,
+		}
+
+		rf.applyCh <- m
+	}
+
+	DPrintf("%d lastApplied: %d", rf.me, rl.lastApplied)
 }
 
 func min(a int, b int) int {
@@ -424,13 +506,27 @@ func (rf *Raft) campaign() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.leader != rf.me {
+		return -1, -1, false
+	}
+
+	//data, _ := json.Marshal(command)
+
+	newEntry := &Entry{
+		Term:  rf.currentTerm,
+		Index: rf.raftLog.lastIndex() + 1,
+		Data:  command,
+	}
+	rf.raftLog.appendSingleEntry(newEntry)
+	rf.raftLog.matchIndex[rf.me] = rf.raftLog.lastIndex()
+	rf.sendEntryToAll()
 
 	// Your code here (2B).
 
-	return index, term, isLeader
+	return newEntry.Index - 1, newEntry.Term, true
 }
 
 //
@@ -495,9 +591,38 @@ func (rf *Raft) handleMsg(msg *message) {
 		}
 		if len(rf.votes) >= 1+len(rf.peers)/2 {
 			rf.becomeLeader()
-			rf.sendEmptyEntryToAll()
+			rf.sendEntryToAll()
 		}
 	case MsgAppendResp:
+		if rf.state != StateLeader {
+			return
+		}
+		args := msg.args.(*AppendEntriesArgs)
+
+		l := rf.raftLog
+
+		if msg.accept {
+			l.matchIndex[msg.from] = args.PrevLogIndex + len(args.Entries)
+			l.nextIndex[msg.from] = args.PrevLogIndex + len(args.Entries) + 1
+
+			matches := make([]int, 0, len(l.matchIndex))
+			matches = append(matches, l.matchIndex...)
+			sort.Slice(matches, func(i, j int) bool {
+				return matches[i] > matches[j]
+			})
+
+			for n := matches[len(l.matchIndex)/2]; n > l.commitIndex; n-- {
+				if l.term(n) == rf.currentTerm {
+					l.commitIndex = n
+					rf.apply()
+					break
+				}
+			}
+			return
+		}
+
+		l.nextIndex[msg.from]--
+		rf.sendEntryTo(msg.from)
 		return
 	}
 }
@@ -531,7 +656,7 @@ func (rf *Raft) tickHeartBeat() {
 
 	if rf.heartbeatElapsed >= rf.heartbeatTimeout {
 		rf.heartbeatElapsed = 0
-		rf.sendEmptyEntryToAll()
+		rf.sendEntryToAll()
 	}
 }
 
@@ -539,23 +664,45 @@ func (rf *Raft) resetRandomizedElectionTimeout() {
 	rf.randomizedElectionTimeout = rf.electionTimeout + rand.Intn(rf.electionTimeout)
 }
 
-func (rf *Raft) sendEmptyEntryToAll() {
-	args := &AppendEntriesArgs{
-		Term:         rf.getCurrentTerm(),
-		LeaderID:     rf.me,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      nil,
-		LeaderCommit: rf.raftLog.commitIndex,
-	}
-
+func (rf *Raft) sendEntryToAll() {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 
-		rf.sendEvent(MsgAppend, i, args)
+		rf.sendEntryTo(i)
 	}
+}
+
+func (rf *Raft) sendEntryTo(peer int) {
+	rl := rf.raftLog
+
+	if peer == rf.me {
+		return
+	}
+
+	args := &AppendEntriesArgs{
+		Term:         rf.getCurrentTerm(),
+		LeaderID:     rf.me,
+		PrevLogIndex: rl.lastIndex(),
+		PrevLogTerm:  rl.lastTerm(),
+		Entries:      nil,
+		LeaderCommit: rf.raftLog.commitIndex,
+	}
+
+	next := rl.peerNext(peer)
+	if rl.lastIndex() >= next {
+		args.Entries = rl.getEntries(next)
+		args.PrevLogIndex = next - 1
+		args.PrevLogTerm = rl.term(next - 1)
+
+		if args.PrevLogTerm == 0 {
+			panic("args.PrevLogTerm == 0")
+		}
+	}
+
+	DPrintf("%d send entry to %d, term: %d, lastIndex: %d, args: %+v", rf.me, peer, rf.getCurrentTerm(), rf.raftLog.lastIndex(), *args)
+	rf.sendEvent(MsgAppend, peer, args)
 }
 
 type stepFunc func()
@@ -604,6 +751,8 @@ func (rf *Raft) becomeLeader() {
 	for i := range rf.peers {
 		rf.raftLog.nextIndex[i] = rf.raftLog.lastIndex() + 1
 	}
+	DPrintf("leader %d's nextIndex: %v", rf.me, rf.raftLog.nextIndex)
+	rf.raftLog.matchIndex[rf.me] = rf.raftLog.lastIndex()
 }
 
 func (rf *Raft) becomeFollower(term int, leader int) {
@@ -645,14 +794,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTimeout = 5
 	rf.electionTimeout = 50
 	rf.resetRandomizedElectionTimeout()
+	rf.applyCh = applyCh
 	//DPrintf("peer[%d] resetRandomizedElectionTimeout: %d", me, rf.randomizedElectionTimeout)
 
 	rf.becomeFollower(1, None)
+	initEntry := &Entry{
+		Term:  1,
+		Index: 1,
+		Data:  nil,
+	}
+
 	rf.raftLog = &raftLog{
-		entries:     make([]*Entry, 0),
+		entries:     []*Entry{initEntry},
+		lastEntry:   initEntry,
 		offset:      1,
-		commitIndex: 0,
-		lastApplied: 0,
+		commitIndex: 1,
+		lastApplied: 1,
 	}
 
 	rf.rpcProxy = newProxy(rf, 20)
