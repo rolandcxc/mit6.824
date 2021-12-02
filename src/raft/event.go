@@ -18,6 +18,9 @@ type message struct {
 	args        interface{}
 	term        int
 	accept      bool
+	matchIndex  int
+	rejectHint  int
+	rejectTerm  int
 }
 
 type proxy struct {
@@ -33,8 +36,8 @@ func newProxy(rf *Raft, workerNum int) *proxy {
 		stop:      make(chan struct{}, 1),
 		peers:     rf.peers,
 		workerNum: workerNum,
-		req:       make(chan *message, workerNum*100),
-		resp:      make(chan *message, workerNum*100*len(rf.peers)),
+		req:       make(chan *message, workerNum*20),
+		resp:      make(chan *message, workerNum*20*len(rf.peers)),
 	}
 }
 
@@ -60,6 +63,9 @@ func (p *proxy) send(msg *message) bool {
 		msg.messageType = MsgAppendResp
 		msg.term = reply.Term
 		msg.accept = reply.Success
+		msg.matchIndex = reply.MatchIndex
+		msg.rejectHint = reply.RejectHint
+		msg.rejectTerm = reply.RejectTerm
 	case MsgVote:
 		reply := &RequestVoteReply{}
 		ok = p.peers[msg.to].Call("Raft."+MsgVote, msg.args, reply)

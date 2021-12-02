@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	//	"bytes"
@@ -139,11 +140,14 @@ func (l *raftLog) getEntries(start int) []*Entry {
 		// TODO Panic
 		return nil
 	}
-	return l.entries[start-l.offset:]
+
+	entries := make([]*Entry, l.lastIndex()-start+1)
+	copy(entries, l.entries[start-l.offset:])
+	return entries
 }
 
 func (l *raftLog) validIndex(index int) bool {
-	if index-l.offset > len(l.entries) {
+	if index-l.offset > len(l.entries)-1 {
 		return false
 	}
 	if index-l.offset < 0 {
@@ -173,10 +177,25 @@ func (l *raftLog) isUpToDate(index, term int) bool {
 	return term > l.lastTerm() || (term == l.lastTerm() && index >= l.lastIndex())
 }
 
-func (l *raftLog) appendEntries(entries []*Entry, preIndex int) {
-	l.entries = l.entries[:preIndex-l.offset+1]
-	l.entries = append(l.entries, entries...)
-	l.lastEntry = entries[len(entries)-1]
+func (l *raftLog) appendEntries(appends []*Entry, preIndex int) {
+	after := preIndex - l.offset + 1
+	i := 0
+	for after < len(l.entries) && i < len(appends) {
+		ent := appends[i]
+		ext := l.entries[after]
+		if ent.Index != ext.Index || ent.Term != ext.Term {
+			break
+		}
+		after++
+		i++
+	}
+
+	if i < len(appends) {
+		l.entries = l.entries[:after]
+		l.entries = append(l.entries, appends[i:]...)
+	}
+
+	l.lastEntry = l.entries[len(l.entries)-1]
 }
 
 func (l *raftLog) appendSingleEntry(entry *Entry) {
@@ -380,9 +399,14 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+func (e *Entry) String() string {
+	return fmt.Sprintf("%+v", *e)
+}
+
 type AppendEntriesReply struct {
 	Term       int
 	Success    bool
+	MatchIndex int // matchIndex
 	RejectHint int
 	RejectTerm int
 }
@@ -392,7 +416,7 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 	defer rf.mu.Unlock()
 
 	defer func() {
-		DPrintf("[AppendEntries]%d, reply: %+v, term: %d, lastIndex: %d, commit: %d", rf.me, *reply, rf.currentTerm, rf.raftLog.lastIndex(), rf.raftLog.commitIndex)
+		DPrintf("[AppendEntries]%d, arg: %+v, reply: %+v, term: %d, lastIndex: %d, commit: %d", rf.me, *arg, *reply, rf.currentTerm, rf.raftLog.lastIndex(), rf.raftLog.commitIndex)
 	}()
 
 	if arg.Term < rf.getCurrentTerm() {
@@ -401,35 +425,49 @@ func (rf *Raft) AppendEntries(arg *AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
-	if arg.Term == rf.getCurrentTerm() && rf.leader != None && rf.leader != arg.LeaderID {
-		DPrintf("%d receive Entries from %d, but leader is %d, term is %d", rf.me, arg.LeaderID, rf.leader, rf.currentTerm)
-	}
+	//if arg.Term == rf.getCurrentTerm() && rf.leader != None && rf.leader != arg.LeaderID {
+	//	DPrintf("%d receive Entries from %d, but leader is %d, term is %d", rf.me, arg.LeaderID, rf.leader, rf.currentTerm)
+	//}
 
 	rf.becomeFollower(arg.Term, arg.LeaderID)
 
-	term := rf.raftLog.term(arg.PrevLogIndex)
+	l := rf.raftLog
+
+	if arg.PrevLogIndex < l.commitIndex {
+		reply.Term = rf.getCurrentTerm()
+		reply.Success = true
+		reply.MatchIndex = l.commitIndex
+		return
+	}
+
+	term := l.term(arg.PrevLogIndex)
 	if term == 0 || term != arg.PrevLogTerm {
+		hint := min(arg.PrevLogIndex, l.lastIndex())
+		reply.RejectHint = l.findConflictByTerm(hint, arg.PrevLogTerm)
+		reply.RejectTerm = l.term(reply.RejectHint)
+
 		reply.Term = rf.getCurrentTerm()
 		reply.Success = false
 		return
 	}
 
 	if len(arg.Entries) > 0 {
-		rf.raftLog.appendEntries(arg.Entries, arg.PrevLogIndex)
+		l.appendEntries(arg.Entries, arg.PrevLogIndex)
 	}
 
-	if arg.LeaderCommit > rf.raftLog.commitIndex {
-		rf.raftLog.commitIndex = min(arg.LeaderCommit, rf.raftLog.lastIndex())
+	if arg.LeaderCommit > l.commitIndex {
+		l.commitIndex = min(arg.LeaderCommit, l.lastIndex())
 		rf.apply()
 	}
 
 	reply.Term = rf.getCurrentTerm()
+	reply.MatchIndex = arg.PrevLogIndex + len(arg.Entries)
 	reply.Success = true
 	return
 }
 
 func (l *raftLog) findConflictByTerm(index int, term int) int {
-	if li := l.lastIndex(); index > li {
+	if index > l.lastIndex() {
 		return index
 	}
 	for {
@@ -442,9 +480,7 @@ func (l *raftLog) findConflictByTerm(index int, term int) int {
 	return index
 }
 
-
 func (rf *Raft) apply() {
-	DPrintf("start apply!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 	rl := rf.raftLog
 	if rl.lastApplied == rl.commitIndex {
 		return
@@ -513,6 +549,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
+	//if rf.raftLog.lastIndex()-rf.raftLog.commitIndex > 5 {
+	//	return -1, -1, false
+	//}
 	//data, _ := json.Marshal(command)
 
 	newEntry := &Entry{
@@ -599,11 +638,33 @@ func (rf *Raft) handleMsg(msg *message) {
 		}
 		args := msg.args.(*AppendEntriesArgs)
 
+		DPrintf("%d handleMsg: %+v", rf.me, *msg)
+
 		l := rf.raftLog
 
-		if msg.accept {
-			l.matchIndex[msg.from] = args.PrevLogIndex + len(args.Entries)
-			l.nextIndex[msg.from] = args.PrevLogIndex + len(args.Entries) + 1
+		if !msg.accept {
+			if l.nextIndex[msg.from]-1 != args.PrevLogIndex {
+				// 已经重试过了
+				return
+			}
+
+			nextProbe := msg.rejectHint
+			if msg.rejectTerm > 0 {
+				nextProbe = l.findConflictByTerm(msg.rejectHint, msg.rejectTerm)
+			}
+
+			l.nextIndex[msg.from] = min(nextProbe+1, args.PrevLogIndex)
+			rf.sendEntryTo(msg.from)
+			return
+		}
+
+		if msg.matchIndex > l.matchIndex[msg.from] {
+			l.matchIndex[msg.from] = msg.matchIndex
+			l.nextIndex[msg.from] = msg.matchIndex + 1
+
+			if msg.matchIndex <= l.commitIndex {
+				return
+			}
 
 			matches := make([]int, 0, len(l.matchIndex))
 			matches = append(matches, l.matchIndex...)
@@ -614,16 +675,13 @@ func (rf *Raft) handleMsg(msg *message) {
 			for n := matches[len(l.matchIndex)/2]; n > l.commitIndex; n-- {
 				if l.term(n) == rf.currentTerm {
 					l.commitIndex = n
+					DPrintf("leader %d commit %d", rf.me, n)
 					rf.apply()
 					break
 				}
 			}
 			return
 		}
-
-		l.nextIndex[msg.from]--
-		rf.sendEntryTo(msg.from)
-		return
 	}
 }
 
@@ -665,6 +723,7 @@ func (rf *Raft) resetRandomizedElectionTimeout() {
 }
 
 func (rf *Raft) sendEntryToAll() {
+	rf.heartbeatElapsed = 0
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -687,7 +746,7 @@ func (rf *Raft) sendEntryTo(peer int) {
 		PrevLogIndex: rl.lastIndex(),
 		PrevLogTerm:  rl.lastTerm(),
 		Entries:      nil,
-		LeaderCommit: rf.raftLog.commitIndex,
+		LeaderCommit: rl.commitIndex,
 	}
 
 	next := rl.peerNext(peer)
@@ -701,7 +760,7 @@ func (rf *Raft) sendEntryTo(peer int) {
 		}
 	}
 
-	DPrintf("%d send entry to %d, term: %d, lastIndex: %d, args: %+v", rf.me, peer, rf.getCurrentTerm(), rf.raftLog.lastIndex(), *args)
+	//DPrintf("%d send entry to %d, term: %d, lastIndex: %d, args: %+v", rf.me, peer, rf.getCurrentTerm(), rf.raftLog.lastIndex(), *args)
 	rf.sendEvent(MsgAppend, peer, args)
 }
 
@@ -812,7 +871,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		lastApplied: 1,
 	}
 
-	rf.rpcProxy = newProxy(rf, 20)
+	rf.rpcProxy = newProxy(rf, 100)
 	rf.rpcProxy.start()
 	// Your initialization code here (2A, 2B, 2C).
 
